@@ -1,19 +1,7 @@
-# Environment variables
+node_modules
+dist
 .env
 .env.local
-.env.*.local
-
-# Dependencies
-node_modules/
-
-# Build output
-dist/
-build/
-
-# Logs
-*.log
-npm-debug.log*
-
-# OS
-.DS_Store
-Thumbs.db
+*.pem
+.turbo
+out
