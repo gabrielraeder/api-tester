@@ -3,6 +3,8 @@ import { persist } from 'zustand/middleware'
 import { createRequest, createCollection, createEnvironment } from '@api-tester/core/collection'
 import { loadCollectionsFromRepo, saveRequest, saveCollectionMeta, createCollectionInRepo, renameCollectionInRepo, deleteRequestFromRepo, deleteCollectionFromRepo } from '@api-tester/core/sync'
 
+const autoSaveTimers = {}
+
 export const useStore = create(
   persist(
     (set, get) => ({
@@ -35,6 +37,9 @@ export const useStore = create(
       githubUser: null,
       githubRepo: null,
 
+      // Tab IDs with changes not yet confirmed saved to GitHub
+      dirtyTabIds: [],
+
       // --- Collections ---
       addCollection(col) {
         set(s => ({ collections: [...s.collections, col ?? createCollection()] }))
@@ -66,7 +71,7 @@ export const useStore = create(
           const activeTabId = s.activeTabId === id
             ? (tabs[tabs.length - 1]?.id ?? null)
             : s.activeTabId
-          return { tabs, activeTabId }
+          return { tabs, activeTabId, dirtyTabIds: s.dirtyTabIds.filter(d => d !== id) }
         })
       },
       newTab() {
@@ -79,7 +84,16 @@ export const useStore = create(
       updateTab(id, patch) {
         set(s => ({
           tabs: s.tabs.map(t => t.id === id ? { ...t, ...patch } : t),
+          collections: updateRequestInCollections(s.collections, id,
+            { ...(s.tabs.find(t => t.id === id) ?? {}), ...patch }
+          ),
+          dirtyTabIds: s.dirtyTabIds.includes(id) ? s.dirtyTabIds : [...s.dirtyTabIds, id],
         }))
+        const { githubToken, githubRepo } = get()
+        if (githubToken && githubRepo) {
+          clearTimeout(autoSaveTimers[id])
+          autoSaveTimers[id] = setTimeout(() => get().saveRequestToGitHub(id), 1500)
+        }
       },
       setActiveTab(id) {
         set({ activeTabId: id })
@@ -125,7 +139,7 @@ export const useStore = create(
         set({ githubRepo: repo })
       },
       clearGithubAuth() {
-        set({ githubToken: null, githubUser: null, githubRepo: null, collections: [] })
+        set({ githubToken: null, githubUser: null, githubRepo: null, collections: [], dirtyTabIds: [] })
       },
 
       // --- GitHub Sync ---
@@ -147,25 +161,28 @@ export const useStore = create(
         const tab = tabs.find(t => t.id === tabId)
         if (!tab) return
 
-        // Find which collection this request belongs to
         const collection = findCollectionForRequest(collections, tab.id)
-        if (!collection?._github) {
-          set({ syncStatus: 'error', syncError: 'Request must belong to a GitHub-connected collection.' })
-          return
-        }
+        if (!collection?._github) return
 
         set({ syncStatus: 'saving', syncError: null })
         try {
           const updated = await saveRequest(githubToken, githubRepo.owner, githubRepo.name, tab, collection._github)
-          // Update tab and collection with new sha
           set(s => ({
             tabs: s.tabs.map(t => t.id === tabId ? updated : t),
             collections: updateRequestInCollections(s.collections, tabId, updated),
+            dirtyTabIds: s.dirtyTabIds.filter(id => id !== tabId),
             syncStatus: 'idle',
           }))
         } catch (err) {
           set({ syncStatus: 'error', syncError: err.message })
         }
+      },
+
+      // Save all tabs with unsaved changes to GitHub
+      async flushDirtyTabs() {
+        const { githubToken, githubRepo, dirtyTabIds } = get()
+        if (!githubToken || !githubRepo || dirtyTabIds.length === 0) return
+        await Promise.allSettled(dirtyTabIds.map(id => get().saveRequestToGitHub(id)))
       },
 
       async createCollectionOnGitHub(collection) {
@@ -187,7 +204,6 @@ export const useStore = create(
         const { githubToken, githubRepo, collections } = get()
         const col = collections.find(c => c.id === collectionId)
         if (!col) return
-        // Optimistic local update
         set(s => ({ collections: s.collections.map(c => c.id === collectionId ? { ...c, name } : c) }))
         if (githubToken && githubRepo && col._github) {
           set({ syncStatus: 'saving', syncError: null })
@@ -211,13 +227,21 @@ export const useStore = create(
         if (!req) return
         const updatedReq = { ...req, name }
         const updatedCol = { ...col, requests: col.requests.map(r => r.id === requestId ? updatedReq : r) }
-        set(s => ({ collections: s.collections.map(c => c.id === collectionId ? updatedCol : c) }))
+        set(s => ({
+          collections: s.collections.map(c => c.id === collectionId ? updatedCol : c),
+          tabs: s.tabs.map(t => t.id === requestId ? { ...t, name } : t),
+        }))
         if (githubToken && githubRepo && req._github?.path) {
           set({ syncStatus: 'saving', syncError: null })
           try {
             const saved = await saveRequest(githubToken, githubRepo.owner, githubRepo.name, updatedReq, col._github)
             const finalCol = { ...updatedCol, requests: updatedCol.requests.map(r => r.id === requestId ? saved : r) }
-            set(s => ({ collections: s.collections.map(c => c.id === collectionId ? finalCol : c), syncStatus: 'idle' }))
+            set(s => ({
+              collections: s.collections.map(c => c.id === collectionId ? finalCol : c),
+              tabs: s.tabs.map(t => t.id === requestId ? { ...t, name, _github: saved._github } : t),
+              dirtyTabIds: s.dirtyTabIds.filter(id => id !== requestId),
+              syncStatus: 'idle',
+            }))
           } catch (err) {
             set({ syncStatus: 'error', syncError: err.message })
           }
@@ -233,6 +257,7 @@ export const useStore = create(
           collections: s.collections.map(c =>
             c.id === collectionId ? { ...c, requests: c.requests.filter(r => r.id !== requestId) } : c
           ),
+          dirtyTabIds: s.dirtyTabIds.filter(id => id !== requestId),
         }))
         if (githubToken && githubRepo && req?._github?.sha) {
           set({ syncStatus: 'saving', syncError: null })
@@ -270,6 +295,9 @@ export const useStore = create(
         githubToken: s.githubToken,
         githubUser: s.githubUser,
         githubRepo: s.githubRepo,
+        tabs: s.tabs,
+        activeTabId: s.activeTabId,
+        dirtyTabIds: s.dirtyTabIds,
       }),
     }
   )
