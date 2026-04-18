@@ -1,0 +1,11 @@
+{
+  "servers": {
+    "ruflo": {
+      "command": "npx",
+      "args": ["ruflo@v3alpha", "mcp", "start"],
+      "env": {
+        "ANTHROPIC_API_KEY": "sk-ant-..."
+      }
+    }
+  }
+}
